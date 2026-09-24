@@ -1,0 +1,48 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build Consensus Pro
+        run: |
+          xcodebuild -project ConsensusSuite.xcodeproj             -scheme ConsensusPro             -configuration Release             -sdk iphoneos             -derivedDataPath build/pro             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO
+          mkdir -p out/pro/Payload
+          cp -R build/pro/Build/Products/Release-iphoneos/ConsensusPro.app out/pro/Payload/
+          cd out/pro
+          zip -qry ../Consensus-Pro.ipa Payload
+
+      - name: Build Consensus Ultra
+        run: |
+          xcodebuild -project ConsensusSuite.xcodeproj             -scheme ConsensusUltra             -configuration Release             -sdk iphoneos             -derivedDataPath build/ultra             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO
+          mkdir -p out/ultra/Payload
+          cp -R build/ultra/Build/Products/Release-iphoneos/ConsensusUltra.app out/ultra/Payload/
+          cd out/ultra
+          zip -qry ../Consensus-Ultra.ipa Payload
+
+      - name: Upload Pro IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Consensus-Pro-IPA
+          path: out/Consensus-Pro.ipa
+
+      - name: Upload Ultra IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Consensus-Ultra-IPA
+          path: out/Consensus-Ultra.ipa
