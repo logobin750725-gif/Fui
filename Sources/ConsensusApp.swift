@@ -1,5 +1,7 @@
 import SwiftUI
 import Security
+import PhotosUI
+import UniformTypeIdentifiers
 
 @main
 struct ConsensusApp: App {
@@ -18,11 +20,33 @@ enum Variant {
     }
 }
 
+struct AttachmentItem: Identifiable, Sendable {
+    let id = UUID()
+    let name: String
+    let mimeType: String
+    let data: Data
+
+    var isTextLike: Bool {
+        mimeType.hasPrefix("text/") ||
+        mimeType == "application/json" ||
+        mimeType == "application/xml"
+    }
+
+    var extractedText: String? {
+        guard isTextLike else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 struct ContentView: View {
     @State private var prompt = ""
     @State private var output = ""
     @State private var busy = false
     @State private var showSettings = false
+    @State private var showFileImporter = false
+    @State private var photoItem: PhotosPickerItem?
+    @State private var attachments: [AttachmentItem] = []
+    @State private var attachmentError = ""
 
     var body: some View {
         NavigationStack {
@@ -34,9 +58,63 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 TextEditor(text: $prompt)
-                    .frame(minHeight: 150)
+                    .frame(minHeight: 130)
                     .padding(10)
                     .overlay(RoundedRectangle(cornerRadius: 12).stroke(.quaternary))
+
+                HStack(spacing: 12) {
+                    PhotosPicker(selection: $photoItem, matching: .images) {
+                        Label("圖片", systemImage: "photo")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        Label("檔案", systemImage: "paperclip")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Spacer()
+
+                    if !attachments.isEmpty {
+                        Text("\(attachments.count)/4")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if !attachments.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(attachments) { item in
+                                HStack(spacing: 6) {
+                                    Image(systemName: item.mimeType.hasPrefix("image/") ? "photo.fill" : "doc.fill")
+                                    Text(item.name)
+                                        .lineLimit(1)
+                                        .font(.caption)
+                                    Button {
+                                        attachments.removeAll { $0.id == item.id }
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(.thinMaterial, in: Capsule())
+                            }
+                        }
+                    }
+                }
+
+                if !attachmentError.isEmpty {
+                    Text(attachmentError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
 
                 Button {
                     Task { await runConsensus() }
@@ -49,7 +127,10 @@ struct ContentView: View {
                     .padding()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(busy || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    busy ||
+                    (prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
+                )
 
                 ScrollView {
                     Text(output.isEmpty ? "結果會顯示在這裡。" : output)
@@ -66,15 +147,98 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showSettings) { SettingsView() }
+            .fileImporter(
+                isPresented: $showFileImporter,
+                allowedContentTypes: [.image, .pdf, .plainText, .text, .json, .data],
+                allowsMultipleSelection: true
+            ) { result in
+                handleFiles(result)
+            }
+            .onChange(of: photoItem) { newItem in
+                guard let newItem else { return }
+                Task { await handlePhoto(newItem) }
+            }
+        }
+    }
+
+    @MainActor
+    private func handlePhoto(_ item: PhotosPickerItem) async {
+        attachmentError = ""
+        guard attachments.count < 4 else {
+            attachmentError = "最多可加入 4 個附件。"
+            return
+        }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                attachmentError = "無法讀取圖片。"
+                return
+            }
+            guard data.count <= 15 * 1024 * 1024 else {
+                attachmentError = "單一附件不可超過 15 MB。"
+                return
+            }
+            let type = item.supportedContentTypes.first?.preferredMIMEType ?? "image/jpeg"
+            attachments.append(
+                AttachmentItem(
+                    name: "圖片-\(attachments.count + 1)",
+                    mimeType: type,
+                    data: data
+                )
+            )
+        } catch {
+            attachmentError = "圖片讀取失敗：\(error.localizedDescription)"
+        }
+        photoItem = nil
+    }
+
+    @MainActor
+    private func handleFiles(_ result: Result<[URL], Error>) {
+        attachmentError = ""
+        do {
+            let urls = try result.get()
+            for url in urls {
+                guard attachments.count < 4 else {
+                    attachmentError = "最多可加入 4 個附件。"
+                    break
+                }
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer {
+                    if scoped { url.stopAccessingSecurityScopedResource() }
+                }
+
+                let data = try Data(contentsOf: url)
+                guard data.count <= 15 * 1024 * 1024 else {
+                    attachmentError = "\(url.lastPathComponent) 超過 15 MB，已略過。"
+                    continue
+                }
+
+                let values = try? url.resourceValues(forKeys: [.contentTypeKey])
+                let mime = values?.contentType?.preferredMIMEType ?? "application/octet-stream"
+                attachments.append(
+                    AttachmentItem(
+                        name: url.lastPathComponent,
+                        mimeType: mime,
+                        data: data
+                    )
+                )
+            }
+        } catch {
+            attachmentError = "檔案讀取失敗：\(error.localizedDescription)"
         }
     }
 
     @MainActor
     private func runConsensus() async {
         busy = true
+        attachmentError = ""
         defer { busy = false }
+
         do {
-            output = try await ConsensusEngine.run(prompt: prompt, ultra: Variant.isUltra)
+            output = try await ConsensusEngine.run(
+                prompt: prompt,
+                ultra: Variant.isUltra,
+                attachments: attachments
+            )
         } catch {
             output = "錯誤：\(error.localizedDescription)"
         }
@@ -99,6 +263,12 @@ struct SettingsView: View {
                         SecureField("xAI / Grok API Key", text: $grok)
                     }
                 }
+
+                Section("附件") {
+                    Text("圖片、PDF 與文字檔會傳給 Gemini。文字類檔案也會抽出文字給其他模型。每次最多 4 個、單檔 15 MB。")
+                        .font(.footnote)
+                }
+
                 Section {
                     Text(Variant.isUltra
                          ? "Ultra 會使用已填入金鑰的模型並行回答，再做衝突偵測與綜合。只填 Gemini 也能使用。"
@@ -123,11 +293,44 @@ struct SettingsView: View {
 }
 
 enum ConsensusEngine {
-    static func run(prompt: String, ultra: Bool) async throws -> String {
-        ultra ? try await runUltra(prompt) : try await runPro(prompt)
+    static func run(
+        prompt: String,
+        ultra: Bool,
+        attachments: [AttachmentItem]
+    ) async throws -> String {
+        ultra
+            ? try await runUltra(prompt, attachments: attachments)
+            : try await runPro(prompt, attachments: attachments)
     }
 
-    static func runPro(_ prompt: String) async throws -> String {
+    private static func promptForOtherModels(
+        _ prompt: String,
+        attachments: [AttachmentItem]
+    ) -> String {
+        let texts = attachments.compactMap { item -> String? in
+            guard let text = item.extractedText else { return nil }
+            return """
+            
+            --- 附件：\(item.name) ---
+            \(text)
+            """
+        }.joined()
+
+        let nonText = attachments
+            .filter { !$0.isTextLike }
+            .map(\.name)
+
+        let note = nonText.isEmpty
+            ? ""
+            : "\n\n[注意：以下非文字附件僅由 Gemini 直接讀取：\(nonText.joined(separator: ", "))]"
+
+        return prompt + texts + note
+    }
+
+    static func runPro(
+        _ prompt: String,
+        attachments: [AttachmentItem]
+    ) async throws -> String {
         guard let key = Keychain.get("gemini"), !key.isEmpty else {
             throw AppError.message("請先在右上角鑰匙設定 Gemini API Key。")
         }
@@ -142,7 +345,14 @@ enum ConsensusEngine {
         var answers: [String] = []
         try await withThrowingTaskGroup(of: String.self) { group in
             for role in roles {
-                group.addTask { try await AI.gemini(key: key, system: role, prompt: prompt) }
+                group.addTask {
+                    try await AI.gemini(
+                        key: key,
+                        system: role,
+                        prompt: prompt,
+                        attachments: attachments
+                    )
+                }
             }
             for try await answer in group { answers.append(answer) }
         }
@@ -166,23 +376,40 @@ enum ConsensusEngine {
         四份回答：
         \(joined)
         """
-        return try await AI.gemini(key: key, system: "你是多模型共識裁判。", prompt: judge)
+
+        return try await AI.gemini(
+            key: key,
+            system: "你是多模型共識裁判。",
+            prompt: judge,
+            attachments: []
+        )
     }
 
-    static func runUltra(_ prompt: String) async throws -> String {
+    static func runUltra(
+        _ prompt: String,
+        attachments: [AttachmentItem]
+    ) async throws -> String {
         var tasks: [(String, () async throws -> String)] = []
+        let expandedPrompt = promptForOtherModels(prompt, attachments: attachments)
 
         if let k = Keychain.get("gemini"), !k.isEmpty {
-            tasks.append(("Gemini", { try await AI.gemini(key: k, system: "獨立回答，重視事實與不確定性。", prompt: prompt) }))
+            tasks.append(("Gemini", {
+                try await AI.gemini(
+                    key: k,
+                    system: "獨立回答，重視事實與不確定性。",
+                    prompt: prompt,
+                    attachments: attachments
+                )
+            }))
         }
         if let k = Keychain.get("openai"), !k.isEmpty {
-            tasks.append(("OpenAI", { try await AI.openAI(key: k, prompt: prompt) }))
+            tasks.append(("OpenAI", { try await AI.openAI(key: k, prompt: expandedPrompt) }))
         }
         if let k = Keychain.get("claude"), !k.isEmpty {
-            tasks.append(("Claude", { try await AI.claude(key: k, prompt: prompt) }))
+            tasks.append(("Claude", { try await AI.claude(key: k, prompt: expandedPrompt) }))
         }
         if let k = Keychain.get("grok"), !k.isEmpty {
-            tasks.append(("Grok", { try await AI.grok(key: k, prompt: prompt) }))
+            tasks.append(("Grok", { try await AI.grok(key: k, prompt: expandedPrompt) }))
         }
 
         guard !tasks.isEmpty else {
@@ -197,7 +424,10 @@ enum ConsensusEngine {
             for try await pair in group { results.append(pair) }
         }
 
-        let dossier = results.map { "### \($0.0)\n\($0.1)" }.joined(separator: "\n\n")
+        let dossier = results.map {
+            "### \($0.0)\n\($0.1)"
+        }.joined(separator: "\n\n")
+
         let synthesisPrompt = """
         你是多模型審查裁判。比較以下模型輸出。
         請輸出：
@@ -216,7 +446,12 @@ enum ConsensusEngine {
         """
 
         if let k = Keychain.get("gemini"), !k.isEmpty {
-            return try await AI.gemini(key: k, system: "證據優先，不因模型數量多就判定正確。", prompt: synthesisPrompt)
+            return try await AI.gemini(
+                key: k,
+                system: "證據優先，不因模型數量多就判定正確。",
+                prompt: synthesisPrompt,
+                attachments: []
+            )
         }
         if let k = Keychain.get("openai"), !k.isEmpty {
             return try await AI.openAI(key: k, prompt: synthesisPrompt)
@@ -226,12 +461,32 @@ enum ConsensusEngine {
 }
 
 enum AI {
-    static func gemini(key: String, system: String, prompt: String) async throws -> String {
-        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(key)")!
+    static func gemini(
+        key: String,
+        system: String,
+        prompt: String,
+        attachments: [AttachmentItem]
+    ) async throws -> String {
+        let url = URL(
+            string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(key)"
+        )!
+
+        var userParts: [[String: Any]] = [["text": prompt.isEmpty ? "請分析附件內容。" : prompt]]
+
+        for item in attachments {
+            userParts.append([
+                "inline_data": [
+                    "mime_type": item.mimeType,
+                    "data": item.data.base64EncodedString()
+                ]
+            ])
+        }
+
         let body: [String: Any] = [
             "system_instruction": ["parts": [["text": system]]],
-            "contents": [["role": "user", "parts": [["text": prompt]]]]
+            "contents": [["role": "user", "parts": userParts]]
         ]
+
         let json = try await post(url: url, headers: [:], body: body)
 
         guard
@@ -241,6 +496,7 @@ enum AI {
         else {
             throw AppError.message("Gemini 回傳格式異常。")
         }
+
         return parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
     }
 
@@ -250,7 +506,11 @@ enum AI {
             "model": "gpt-5-mini",
             "messages": [["role": "user", "content": prompt]]
         ]
-        let json = try await post(url: url, headers: ["Authorization": "Bearer \(key)"], body: body)
+        let json = try await post(
+            url: url,
+            headers: ["Authorization": "Bearer \(key)"],
+            body: body
+        )
 
         if let choices = json["choices"] as? [[String: Any]],
            let message = choices.first?["message"] as? [String: Any],
@@ -269,7 +529,10 @@ enum AI {
         ]
         let json = try await post(
             url: url,
-            headers: ["x-api-key": key, "anthropic-version": "2023-06-01"],
+            headers: [
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01"
+            ],
             body: body
         )
 
@@ -285,7 +548,11 @@ enum AI {
             "model": "grok-4-fast",
             "messages": [["role": "user", "content": prompt]]
         ]
-        let json = try await post(url: url, headers: ["Authorization": "Bearer \(key)"], body: body)
+        let json = try await post(
+            url: url,
+            headers: ["Authorization": "Bearer \(key)"],
+            body: body
+        )
 
         if let choices = json["choices"] as? [[String: Any]],
            let message = choices.first?["message"] as? [String: Any],
@@ -295,7 +562,11 @@ enum AI {
         throw AppError.message("Grok 回傳格式異常。")
     }
 
-    private static func post(url: URL, headers: [String: String], body: [String: Any]) async throws -> [String: Any] {
+    private static func post(
+        url: URL,
+        headers: [String: String],
+        body: [String: Any]
+    ) async throws -> [String: Any] {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -303,16 +574,20 @@ enum AI {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: req)
+
         guard let http = response as? HTTPURLResponse else {
             throw AppError.message("網路回應無效。")
         }
+
         guard (200..<300).contains(http.statusCode) else {
             let msg = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
             throw AppError.message(msg)
         }
+
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw AppError.message("JSON 解析失敗。")
         }
+
         return json
     }
 }
@@ -345,6 +620,7 @@ enum Keychain {
         guard status == errSecSuccess, let data = item as? Data else {
             return nil
         }
+
         return String(data: data, encoding: .utf8)
     }
 }
