@@ -493,7 +493,7 @@ enum AI {
 
         for model in models {
             let url = URL(
-                string: "https://generativelanguage.googleapis.com/v1beta/models/\\(model):generateContent"
+                string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
             )!
 
             do {
