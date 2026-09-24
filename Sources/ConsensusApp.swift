@@ -468,7 +468,7 @@ enum AI {
         attachments: [AttachmentItem]
     ) async throws -> String {
         let url = URL(
-            string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\(key)"
+            string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=\(key)"
         )!
 
         var userParts: [[String: Any]] = [["text": prompt.isEmpty ? "請分析附件內容。" : prompt]]
@@ -487,7 +487,7 @@ enum AI {
             "contents": [["role": "user", "parts": userParts]]
         ]
 
-        let json = try await post(url: url, headers: [:], body: body)
+        let json = try await post(url: url, headers: ["x-goog-api-key": key], body: body)
 
         guard
             let candidates = json["candidates"] as? [[String: Any]],
