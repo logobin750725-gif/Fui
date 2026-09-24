@@ -467,9 +467,11 @@ enum AI {
         prompt: String,
         attachments: [AttachmentItem]
     ) async throws -> String {
-        let url = URL(
-            string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=\(key)"
-        )!
+        let models = [
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash-lite"
+        ]
 
         var userParts: [[String: Any]] = [["text": prompt.isEmpty ? "請分析附件內容。" : prompt]]
 
@@ -487,17 +489,43 @@ enum AI {
             "contents": [["role": "user", "parts": userParts]]
         ]
 
-        let json = try await post(url: url, headers: ["x-goog-api-key": key], body: body)
+        var lastError: Error?
 
-        guard
-            let candidates = json["candidates"] as? [[String: Any]],
-            let content = candidates.first?["content"] as? [String: Any],
-            let parts = content["parts"] as? [[String: Any]]
-        else {
-            throw AppError.message("Gemini 回傳格式異常。")
+        for model in models {
+            let url = URL(
+                string: "https://generativelanguage.googleapis.com/v1beta/models/\\(model):generateContent"
+            )!
+
+            do {
+                let json = try await postWithRetry(
+                    url: url,
+                    headers: ["x-goog-api-key": key],
+                    body: body,
+                    maxAttempts: 4
+                )
+
+                guard
+                    let candidates = json["candidates"] as? [[String: Any]],
+                    let content = candidates.first?["content"] as? [String: Any],
+                    let parts = content["parts"] as? [[String: Any]]
+                else {
+                    throw AppError.message("Gemini 回傳格式異常。")
+                }
+
+                return parts.compactMap { $0["text"] as? String }.joined(separator: "\\n")
+            } catch {
+                lastError = error
+
+                if case AppError.httpStatus(let code, _) = error,
+                   code == 429 || code == 503 || (500...599).contains(code) {
+                    continue
+                }
+
+                throw error
+            }
         }
 
-        return parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
+        throw lastError ?? AppError.message("Gemini 目前不可用，請稍後再試。")
     }
 
     static func openAI(key: String, prompt: String) async throws -> String {
@@ -562,6 +590,39 @@ enum AI {
         throw AppError.message("Grok 回傳格式異常。")
     }
 
+    private static func postWithRetry(
+        url: URL,
+        headers: [String: String],
+        body: [String: Any],
+        maxAttempts: Int
+    ) async throws -> [String: Any] {
+        var attempt = 0
+        var delayNanoseconds: UInt64 = 1_000_000_000
+        var lastError: Error?
+
+        while attempt < maxAttempts {
+            attempt += 1
+
+            do {
+                return try await post(url: url, headers: headers, body: body)
+            } catch {
+                lastError = error
+
+                if case AppError.httpStatus(let code, _) = error,
+                   code == 408 || code == 429 || (500...599).contains(code),
+                   attempt < maxAttempts {
+                    try? await Task.sleep(nanoseconds: delayNanoseconds)
+                    delayNanoseconds = min(delayNanoseconds * 2, 8_000_000_000)
+                    continue
+                }
+
+                throw error
+            }
+        }
+
+        throw lastError ?? AppError.message("網路請求失敗。")
+    }
+
     private static func post(
         url: URL,
         headers: [String: String],
@@ -580,8 +641,8 @@ enum AI {
         }
 
         guard (200..<300).contains(http.statusCode) else {
-            let msg = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
-            throw AppError.message(msg)
+            let msg = String(data: data, encoding: .utf8) ?? "HTTP \\(http.statusCode)"
+            throw AppError.httpStatus(http.statusCode, msg)
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -627,10 +688,13 @@ enum Keychain {
 
 enum AppError: LocalizedError {
     case message(String)
+    case httpStatus(Int, String)
 
     var errorDescription: String? {
         switch self {
         case .message(let message):
+            return message
+        case .httpStatus(_, let message):
             return message
         }
     }
